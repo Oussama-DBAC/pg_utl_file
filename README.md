@@ -149,5 +149,3 @@ If you cannot install C extensions (e.g., managed Cloud DBs like AWS RDS / Googl
 - **Memory/FD limits:** We impose a `MAX_OPEN_FILES` sequence array internally to limit malicious sessions from starving OS file descriptors.
 - **Buffering:** Native C `fgets`/`fputs` allows high-speed string chunk IO buffers perfectly bounded within `work_mem` constraints. Large files (several GBs) will read steadily with exact typical disk speed with zero excessive memory ballooning.
 
-## 7. Limitations & Improvements
-- Oracle `UTL_FILE` allows handles to remain open outside the transaction barrier inside the same logical session. This extension correctly and strictly closes handles gracefully when a `COMMIT` or `ROLLBACK` signal hits using standard pg transaction callbacks. This fundamentally aligns with PostgreSQL ACID best practices but limits holding file pointers open dynamically spanning across massive transaction boundaries.
