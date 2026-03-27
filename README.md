@@ -63,12 +63,10 @@ DECLARE
     v_file utl_file_type;
     v_line text;
 BEGIN
-    -- 1. WRITE STEP
     v_file := utl_file_fopen('MY_DIR', 'test_file.txt', 'w');
     PERFORM utl_file_put_line(v_file, 'Hello World From PostgreSQL!');
     v_file := utl_file_fclose(v_file);
 
-    -- 2. READ STEP
     v_file := utl_file_fopen('MY_DIR', 'test_file.txt', 'r');
     
     LOOP
@@ -96,10 +94,8 @@ DECLARE
 BEGIN
     v_file := utl_file_fopen('MY_DIR', 'employees.csv', 'w');
     
-    -- Write CSV Header
     PERFORM utl_file_put_line(v_file, 'ID;NAME;DEPARTMENT;SALARY');
     
-    -- Loop through a database table and write data line by line
     FOR v_record IN SELECT * FROM my_employees_table LOOP
         v_csv_line := v_record.id || ';' || v_record.name || ';' || v_record.department || ';' || v_record.salary;
         PERFORM utl_file_put_line(v_file, v_csv_line);
@@ -121,8 +117,6 @@ BEGIN
     v_file := utl_file_fopen('MY_DIR', 'external_logs.txt', 'r');
     
     LOOP
-        -- IMPORTANT: Isolate the read in its own BEGIN block to prevent the 
-        -- NO_DATA_FOUND exception from rolling back your previous INSERT statements!
         BEGIN
             v_line := utl_file_get_line(v_file);
         EXCEPTION
