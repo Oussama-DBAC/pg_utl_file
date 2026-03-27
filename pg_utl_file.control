@@ -1,5 +1,5 @@
 # pg_utl_file extension
-comment = 'Production-grade equivalent of Oracle UTL_FILE for PostgreSQL'
+comment = 'Equivalent of Oracle UTL_FILE for PostgreSQL'
 default_version = '1.0'
 module_pathname = '$libdir/pg_utl_file'
 relocatable = false
