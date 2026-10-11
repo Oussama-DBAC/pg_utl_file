@@ -144,8 +144,16 @@ If you cannot install C extensions (e.g., managed Cloud DBs like AWS RDS / Googl
 ## 5. Security Best Practices
 - **Never grant INSERT/UPDATE/DELETE on `utl_file_directories` to public**. Only DB administrators should be able to dictate what paths on the OS the `postgres` user can traverse. 
 - Files created by this extension are owned by the `postgres` OS user default group. To allow other system users to overwrite them, either change standard Postgres umask configurations or enforce external cron scripts fixing OS permissions.
+- **Always go through the `utl_file_*` wrapper functions, never the low-level `_utl_file_*` functions.** The directory whitelist and filename/traversal checks live in the wrappers; the low-level C functions open a raw path and `EXECUTE` on them is revoked from `PUBLIC`. Do not re-grant it.
+- **Keep approved directories non-world-writable.** The extension refuses to open a path whose final component is a symlink, but a world-writable approved directory still widens the attack surface (TOCTOU). Prefer directories owned by the `postgres` OS user.
 
 ## 6. Performance Considerations
 - **Memory/FD limits:** We impose a `MAX_OPEN_FILES` sequence array internally to limit malicious sessions from starving OS file descriptors.
-- **Buffering:** Native C `fgets`/`fputs` allows high-speed string chunk IO buffers perfectly bounded within `work_mem` constraints. Large files (several GBs) will read steadily with exact typical disk speed with zero excessive memory ballooning.
+- **`max_linesize` bounds read memory.** `utl_file_fopen(..., max_linesize)` (default 1024, range 1..32767) caps how many bytes `get_line` buffers for a single line. A physical line longer than `max_linesize` is returned over successive `get_line` calls in `max_linesize`-sized chunks, so reads stay bounded regardless of file content.
+- **Buffering:** Native C `fgets`/`fputs` allows high-speed string chunk IO buffers. Large files (several GBs) read steadily at typical disk speed with bounded memory.
+
+## 7. Behavior and Limitations
+- **Handles are transaction-scoped, not session-scoped.** A file handle is invalidated when the transaction that opened it commits or aborts (the `get_line`/`put_line` calls will report an invalid handle afterwards). This differs from Oracle, where a handle lives for the session. Open, use, and close a file within the same transaction; for work that spans commits, re-open the file.
+- **Supported API is a subset of Oracle `UTL_FILE`:** `FOPEN`, `PUT_LINE`, `GET_LINE`, `FFLUSH`, `FCLOSE`, `IS_OPEN`. Not (yet) implemented: `PUT`/`NEW_LINE` (write without / only a newline), `GET_LINE` with an explicit length, `FCLOSE_ALL`, `FREMOVE`, `FRENAME`, `FCOPY`, `FGETATTR`.
+- **End of file** is signalled by raising `NO_DATA_FOUND` from `get_line` (trap it to detect EOF, as shown in the examples above).
 
