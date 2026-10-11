@@ -4,6 +4,9 @@
 #include "storage/fd.h"
 #include "access/xact.h"
 
+#include <ctype.h>
+#include <sys/stat.h>
+
 PG_MODULE_MAGIC;
 
 #define MAX_OPEN_FILES 100
@@ -12,6 +15,7 @@ typedef struct {
     int id;
     FILE *fp;
     bool in_use;
+    SubTransactionId subid;
 } UTLFileHandle;
 
 static UTLFileHandle file_handles[MAX_OPEN_FILES];
@@ -28,6 +32,36 @@ static void utl_file_xact_callback(XactEvent event, void *arg) {
     }
 }
 
+/*
+ * When a subtransaction (e.g. a PL/pgSQL BEGIN ... EXCEPTION block) aborts,
+ * PostgreSQL's fd.c automatically closes any files opened with AllocateFile()
+ * during that subtransaction. Our handle array would otherwise keep a stale
+ * FILE* and a later put_line/get_line would dereference freed memory
+ * (use-after-free). Drop any handle opened at or below the aborting
+ * subtransaction level. We must NOT call FreeFile() here: fd.c already closed
+ * the file, so freeing it again would be a double free.
+ */
+static void utl_file_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+                                      SubTransactionId parentSubid, void *arg) {
+    int i;
+    if (event == SUBXACT_EVENT_ABORT_SUB) {
+        for (i = 0; i < MAX_OPEN_FILES; i++) {
+            if (file_handles[i].in_use && file_handles[i].subid >= mySubid) {
+                file_handles[i].in_use = false;
+                file_handles[i].fp = NULL;
+            }
+        }
+    }
+}
+
+static void utl_file_register_callbacks(void) {
+    if (!xact_callback_registered) {
+        RegisterXactCallback(utl_file_xact_callback, NULL);
+        RegisterSubXactCallback(utl_file_subxact_callback, NULL);
+        xact_callback_registered = true;
+    }
+}
+
 Datum utl_file_fopen(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(utl_file_fopen);
 
@@ -40,10 +74,18 @@ Datum utl_file_fopen(PG_FUNCTION_ARGS) {
     int slot = -1;
     int i;
     FILE *fp;
-    
+    struct stat st;
+
     if (strstr(fullpath, "..") != NULL) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_NAME),
                         errmsg("UTL_FILE invalid path: directory traversal is not allowed")));
+    }
+
+    /* Reject a multi-character mode outright instead of silently using only
+     * the first character. */
+    if (mode[0] == '\0' || mode[1] != '\0') {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                        errmsg("UTL_FILE invalid file open mode. Use 'r', 'w', or 'a'")));
     }
 
     c_mode[0] = tolower((unsigned char)mode[0]);
@@ -52,10 +94,16 @@ Datum utl_file_fopen(PG_FUNCTION_ARGS) {
                         errmsg("UTL_FILE invalid file open mode. Use 'r', 'w', or 'a'")));
     }
 
-    if (!xact_callback_registered) {
-        RegisterXactCallback(utl_file_xact_callback, NULL);
-        xact_callback_registered = true;
+    /* Refuse to open a path whose final component is a symbolic link, so a
+     * symlink planted inside an approved directory cannot redirect I/O
+     * outside it. (A small TOCTOU window remains between lstat() and open();
+     * keep approved directories non-world-writable to close it fully.) */
+    if (lstat(fullpath, &st) == 0 && S_ISLNK(st.st_mode)) {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_NAME),
+                        errmsg("UTL_FILE refuses to open symbolic link \"%s\"", fullpath)));
     }
+
+    utl_file_register_callbacks();
 
     for (i = 0; i < MAX_OPEN_FILES; i++) {
         if (!file_handles[i].in_use) {
@@ -63,7 +111,7 @@ Datum utl_file_fopen(PG_FUNCTION_ARGS) {
             break;
         }
     }
-    
+
     if (slot == -1) {
         ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                         errmsg("Too many open files in UTL_FILE session (max %d)", MAX_OPEN_FILES)));
@@ -78,6 +126,7 @@ Datum utl_file_fopen(PG_FUNCTION_ARGS) {
     file_handles[slot].id = current_id_seq++;
     file_handles[slot].fp = fp;
     file_handles[slot].in_use = true;
+    file_handles[slot].subid = GetCurrentSubTransactionId();
 
     PG_RETURN_INT32(file_handles[slot].id);
 }
@@ -99,7 +148,7 @@ Datum utl_file_put_line(PG_FUNCTION_ARGS) {
             break;
         }
     }
-    
+
     if (!fp) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("Invalid UTL_FILE handle. File might be closed or opened in a previous transaction.")));
     }
@@ -108,7 +157,7 @@ Datum utl_file_put_line(PG_FUNCTION_ARGS) {
     if (fputs(str, fp) == EOF || fputs("\n", fp) == EOF) {
         ereport(ERROR, (errcode_for_file_access(), errmsg("UTL_FILE could not write to file: %m")));
     }
-    
+
     if (autoflush) {
         fflush(fp);
     }
@@ -125,20 +174,20 @@ Datum utl_file_get_line(PG_FUNCTION_ARGS) {
     StringInfoData buf;
     char tmp[1024];
     int i;
-    
+
     for (i = 0; i < MAX_OPEN_FILES; i++) {
         if (file_handles[i].in_use && file_handles[i].id == id) {
             fp = file_handles[i].fp;
             break;
         }
     }
-    
+
     if (!fp) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("Invalid UTL_FILE handle")));
     }
 
     initStringInfo(&buf);
-    
+
     while (fgets(tmp, sizeof(tmp), fp) != NULL) {
         appendStringInfoString(&buf, tmp);
         if (buf.len > 0 && buf.data[buf.len - 1] == '\n') {
@@ -151,11 +200,11 @@ Datum utl_file_get_line(PG_FUNCTION_ARGS) {
             break;
         }
     }
-    
+
     if (buf.len == 0 && feof(fp)) {
         ereport(ERROR, (errcode(ERRCODE_NO_DATA_FOUND), errmsg("UTL_FILE read error: end of file reached")));
     }
-    
+
     PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
 
@@ -165,14 +214,14 @@ PG_FUNCTION_INFO_V1(utl_file_fflush);
 Datum utl_file_fflush(PG_FUNCTION_ARGS) {
     int id = PG_GETARG_INT32(0);
     int i;
-    
+
     for (i = 0; i < MAX_OPEN_FILES; i++) {
         if (file_handles[i].in_use && file_handles[i].id == id) {
             fflush(file_handles[i].fp);
             PG_RETURN_VOID();
         }
     }
-    
+
     ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("Invalid UTL_FILE handle")));
     PG_RETURN_VOID();
 }
@@ -183,7 +232,7 @@ PG_FUNCTION_INFO_V1(utl_file_fclose);
 Datum utl_file_fclose(PG_FUNCTION_ARGS) {
     int id = PG_GETARG_INT32(0);
     int i;
-    
+
     for (i = 0; i < MAX_OPEN_FILES; i++) {
         if (file_handles[i].in_use && file_handles[i].id == id) {
             FreeFile(file_handles[i].fp);
@@ -192,7 +241,7 @@ Datum utl_file_fclose(PG_FUNCTION_ARGS) {
             PG_RETURN_VOID();
         }
     }
-    
+
     PG_RETURN_VOID();
 }
 
@@ -202,12 +251,12 @@ PG_FUNCTION_INFO_V1(utl_file_is_open);
 Datum utl_file_is_open(PG_FUNCTION_ARGS) {
     int id = PG_GETARG_INT32(0);
     int i;
-    
+
     for (i = 0; i < MAX_OPEN_FILES; i++) {
         if (file_handles[i].in_use && file_handles[i].id == id) {
             PG_RETURN_BOOL(true);
         }
     }
-    
+
     PG_RETURN_BOOL(false);
 }
